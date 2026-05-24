@@ -11,12 +11,18 @@ SECRET_KEY = os.environ.get('SECRET_KEY')
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('CHAT_ID')
 
-# إعداد منصة بينانس
+# إعداد منصة بينانس مع توجيه الطلبات لخادم بديل لتفادي الحظر الجغرافي الأمريكي
 binance = ccxt.binance({
     'apiKey': API_KEY,
     'secret': SECRET_KEY,
     'enableRateLimit': True,
-    'options': {'defaultType': 'spot'}
+    'options': {'defaultType': 'spot'},
+    'urls': {
+        'api': {
+            'public': 'https://api3.binance.com/api/v3',
+            'private': 'https://api3.binance.com/api/v3',
+        }
+    }
 })
 
 def send_telegram_message(message):
@@ -68,10 +74,9 @@ def analyze_indicators(symbol, timeframe='4h'):
             
         df = pd.concat([df, macd_df], axis=1)
         
-        # تسمية أعمدة الماكد تلقائياً حسب الفريم
+        # تسمية أعمدة الماكد تلقائياً
         macd_col = 'MACD_12_26_9'
         signal_col = 'MACDs_12_26_9'
-        hist_col = 'MACDh_12_26_9'
         
         # 1. فحص تقاطع الماكد الإيجابي (حديث: أقل من 3 شمعات)
         macd_cross = False
@@ -94,8 +99,7 @@ def analyze_indicators(symbol, timeframe='4h'):
             rsi_status = "🟡 مقبول"
             rsi_valid = True
 
-        # 3. فحص الدايفرجنس (تقريبي ومبسط برمجياً)
-        # إذا كان السعر في آخر 10 شمعات يصنع قاعاً أدنى، والـ RSI يصنع قاعاً أعلى
+        # 3. فحص الدايفرجنس
         divergence = False
         if df['close'].iloc[-1] < df['close'].iloc[-10] and df['RSI'].iloc[-1] > df['RSI'].iloc[-10]:
             divergence = True
@@ -113,7 +117,7 @@ def analyze_indicators(symbol, timeframe='4h'):
         return None
 
 def run_scanner():
-    print("🔄 بدء المسح وفلترة السوق بناءً على شروطك الحرمة...")
+    print("🔄 بدء المسح عبر الخادم البديل وتطبيق الفلترة...")
     candidates = get_market_data_24h()
     print(f"🔍 العملات المطابقة للفلترة الأولية (سيولة وتغيير): {len(candidates)} عملة.")
     
@@ -122,36 +126,31 @@ def run_scanner():
         if not analysis:
             continue
             
-        # عداد الشروط الأساسية تحقق (3/3)
         conditions_met = 0
         if analysis['divergence']: conditions_met += 1
         if analysis['macd_cross']: conditions_met += 1
         if analysis['rsi_valid']: conditions_met += 1
         
-        # إذا تحققت الـ 3 شروط الأساسية كاملة، أرسل إشارة فورية لتليجرام
         if conditions_met == 3:
             msg = (
                 f"🚨 **إشارة رادار جديدة (تحقق الشروط 3/3)** 🚨\n\n"
                 f"🪙 **العملة:** `{symbol}`\n"
                 f"💰 **السعر الحالي:** `{analysis['last_price']}`\n"
                 f"📈 **حالة الـ RSI:** {analysis['rsi_status']} ({analysis['rsi_val']})\n"
-                f"📊 **تقاطع MACD:** ✅ إيجابي (حديث)\n"
+                f"📊 **تقاطع MACD:** ✅ إيجابي\n"
                 f"📉 **الإنحراف (Divergence):** ✅ إيجابي متكون على 4H\n\n"
-                f"📋 **توصية إدارة الصفقة:**\n"
                 f"🎯 هدف جني الأرباح (TP): +2% إلى +3%\n"
-                f"🛑 وقف الخسارة (SL): -1% إلى -1.5%\n"
-                f"⚖️ نسبة المخاطرة $R:R$ مطابقة لشرطك (أكبر من 1:2)"
+                f"🛑 وقف الخسارة (SL): -1% إلى -1.5%"
             )
             send_telegram_message(msg)
             
     print("✅ تم انتهاء المسح الحالي بنجاح.")
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 الرادار السحابي المطور تم تفعيله ويراقب السوق بشروطك الآن!")
+    send_telegram_message("🚀 تم تحديث نظام الرادار وتوجيه المسار لتجاوز القيود الجغرافية!")
     while True:
         try:
             run_scanner()
         except Exception as e:
-            print(f"حدث خطأ غير متوقع في الحلقة الرئيسية: {e}")
-        # البوت سيفحص السوق كاملاً كل 15 دقيقة بناءً على حركية فريم 4 ساعات
+            print(f"حدث خطأ في الحلقة الرئيسية: {e}")
         time.sleep(900)
