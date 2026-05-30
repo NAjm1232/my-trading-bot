@@ -6,7 +6,18 @@ import pandas as pd
 from datetime import datetime, date
 
 # ============================================================
-# RADAR v3.1 — Smart Sleep + Fixed Notifications
+# RADAR v4.0 — 9 Core Improvements
+# ============================================================
+# CHANGE LOG vs v3.1:
+# [1] pre_oversold: <35 → <30  (true exhaustion only)
+# [2] MACD lookback: 4 → 3    (fresher crossover)
+# [3] Swing lookback: 2 → 3   (cleaner swing detection)
+# [4] Strict lower low: removed 1.005 tolerance (real LL only)
+# [5] Min swing distance: >=6 candles (no noise divergence)
+# [6] Recent divergence: 10 → 7 candles (fresh signal)
+# [7] MACD below zero = new bonus (more upside room)
+# [8] WATCH: div4 required + rr>=1.5 (no weak signals)
+# [9] Histogram acceleration = new bonus (momentum building)
 # ============================================================
 
 API_KEY        = os.environ.get('API_KEY')
@@ -36,7 +47,7 @@ STABLE_COINS     = {'USDC','BUSD','TUSD','USDP','FDUSD','DAI','FRAX'}
 # State tracking
 alerted_today       = {}
 sleep_mode_notified = False
-btc_sleep_low       = None  # tracks BTC price when it entered sleep
+btc_sleep_low       = None
 
 # ============================================================
 # FEAR & GREED
@@ -61,23 +72,20 @@ def get_fear_greed():
 
 # ============================================================
 # SMART BTC FILTER
-# Returns: 'healthy' | 'light_sleep' | 'deep_sleep'
 # ============================================================
 def get_btc_status():
     global btc_sleep_low
     try:
-        ticker  = binance.fetch_ticker('BTC/USDT')
-        chg     = ticker.get('percentage', 0) or 0
+        ticker    = binance.fetch_ticker('BTC/USDT')
+        chg       = ticker.get('percentage', 0) or 0
         btc_price = ticker.get('last', 0) or 0
 
         if chg > -3.0:
             return 'healthy', chg, btc_price
 
-        # BTC is down — track the low point
         if btc_sleep_low is None or btc_price < btc_sleep_low:
             btc_sleep_low = btc_price
 
-        # Check if BTC recovered +1% from its low
         if btc_sleep_low and btc_price >= btc_sleep_low * 1.01:
             return 'recovering', chg, btc_price
 
@@ -151,7 +159,8 @@ def calc_macd(closes, fast=12, slow=26, signal=9):
     histogram   = macd_line - signal_line
     return macd_line.tolist(), signal_line.tolist(), histogram.tolist()
 
-def find_swing_lows(data, lookback=2):
+# [FIX #3] Swing lookback: 2 → 3 (cleaner swing detection)
+def find_swing_lows(data, lookback=3):
     swings = []
     for i in range(lookback, len(data) - lookback):
         if all(data[i] <= data[i-j] for j in range(1, lookback+1)) and \
@@ -162,18 +171,34 @@ def find_swing_lows(data, lookback=2):
 def check_rsi_divergence(closes, rsi_vals):
     if len(closes) < 20 or len(rsi_vals) < 20:
         return False, False
-    swings = find_swing_lows(closes, lookback=2)
+
+    # [FIX #3] Uses updated find_swing_lows with lookback=3
+    swings = find_swing_lows(closes, lookback=3)
     if len(swings) < 2:
         return False, False
-    i1, i2       = swings[-2], swings[-1]
-    price_lower  = closes[i2] < closes[i1] * 1.005
-    rsi_higher   = rsi_vals[i2] > rsi_vals[i1] + 1.5
-    recent       = i2 >= len(closes) - 10
-    pre_oversold = rsi_vals[i1] < 35
-    divergence   = price_lower and rsi_higher and recent
+
+    i1, i2 = swings[-2], swings[-1]
+
+    # [FIX #5] Min swing distance: >=6 candles between swings
+    if (i2 - i1) < 6:
+        return False, False
+
+    # [FIX #4] Strict lower low: removed 1.005 tolerance
+    price_lower = closes[i2] < closes[i1]
+
+    rsi_higher  = rsi_vals[i2] > rsi_vals[i1] + 1.5
+
+    # [FIX #6] Recent check: 10 → 7 candles
+    recent = i2 >= len(closes) - 7
+
+    # [FIX #1] pre_oversold: <35 → <30
+    pre_oversold = rsi_vals[i1] < 30
+
+    divergence = price_lower and rsi_higher and recent
     return divergence, pre_oversold
 
-def check_macd_cross(histogram, lookback=4):
+# [FIX #2] MACD lookback: 4 → 3
+def check_macd_cross(histogram, lookback=3):
     n = len(histogram)
     if n < lookback + 2:
         return False, 0
@@ -182,6 +207,13 @@ def check_macd_cross(histogram, lookback=4):
         if histogram[idx] >= 0 and histogram[idx-1] < 0:
             return True, i - 1
     return False, 0
+
+# [NEW #9] Histogram acceleration: 3 consecutive increases = momentum building
+def check_histogram_acceleration(histogram):
+    if len(histogram) < 4:
+        return False
+    recent = histogram[-4:]
+    return recent[-1] > recent[-2] > recent[-3] > recent[-4]
 
 def classify_rsi(val):
     if val < 30:   return 'oversold🔥', True
@@ -205,10 +237,10 @@ def calc_volume_ratio(volumes):
     return (volumes[-1] / median) if median > 0 else 0.0
 
 def calc_structural_sl(closes, lows, price):
-    swing_lows = find_swing_lows(lows, lookback=2)
-    candidates = [lows[i] for i in swing_lows if lows[i] < price * 0.995]
+    swing_lows    = find_swing_lows(lows, lookback=3)
+    candidates    = [lows[i] for i in swing_lows if lows[i] < price * 0.995]
     structural_sl = max(candidates) if candidates else price * 0.982
-    sl_pct = abs((structural_sl - price) / price * 100)
+    sl_pct        = abs((structural_sl - price) / price * 100)
     if sl_pct > 2.0:
         return None, sl_pct
     return structural_sl, sl_pct
@@ -220,9 +252,9 @@ def calc_tp(price, highs):
            highs[i] > highs[i+1] and highs[i] > highs[i+2]:
             swing_highs.append(highs[i])
     res_candidates = [h for h in swing_highs if h > price * 1.005]
-    resistance = min(res_candidates) if res_candidates else price * 1.025
-    tp_dist    = min(resistance - price, price * 0.035)
-    tp         = max(price + tp_dist, price * 1.02)
+    resistance     = min(res_candidates) if res_candidates else price * 1.025
+    tp_dist        = min(resistance - price, price * 0.035)
+    tp             = max(price + tp_dist, price * 1.02)
     return tp, resistance
 
 def check_bullish_candle(klines):
@@ -234,35 +266,41 @@ def check_bullish_candle(klines):
     chg = (close_p - open_p) / open_p * 100
     return chg >= 0.3, round(chg, 2)
 
+# ============================================================
+# CORE ANALYZER
+# ============================================================
 def analyze(symbol, is_negative):
     try:
         ohlcv_4h = binance.fetch_ohlcv(symbol, '4h', limit=100)
         if len(ohlcv_4h) < 35:
             return None
-        df4 = pd.DataFrame(ohlcv_4h, columns=['ts','open','high','low','close','volume'])
+        df4        = pd.DataFrame(ohlcv_4h, columns=['ts','open','high','low','close','volume'])
         closes_4h  = df4['close'].tolist()
         highs_4h   = df4['high'].tolist()
         lows_4h    = df4['low'].tolist()
         volumes_4h = df4['volume'].tolist()
 
-        ohlcv_1h = binance.fetch_ohlcv(symbol, '1h', limit=60)
-        df1      = pd.DataFrame(ohlcv_1h, columns=['ts','open','high','low','close','volume'])
+        ohlcv_1h  = binance.fetch_ohlcv(symbol, '1h', limit=60)
+        df1       = pd.DataFrame(ohlcv_1h, columns=['ts','open','high','low','close','volume'])
         closes_1h = df1['close'].tolist()
 
         price = closes_4h[-1]
 
-        # 4H
+        # --- 4H ---
         rsi4_vals          = calc_rsi(closes_4h)
         ml4, sl4, hist4    = calc_macd(closes_4h)
         rsi4_last          = rsi4_vals[-1]
         rsi4_cls, rsi4_v   = classify_rsi(rsi4_last)
         div4, pre_oversold = check_rsi_divergence(closes_4h, rsi4_vals)
-        cross4, cross4_age = check_macd_cross(hist4)
+        cross4, cross4_age = check_macd_cross(hist4)       # [FIX #2] lookback=3
         trend4             = calc_general_trend(closes_4h)
         vol_ratio          = calc_volume_ratio(volumes_4h)
         bullish_candle, candle_chg = check_bullish_candle(ohlcv_4h)
 
-        # 1H
+        # [FIX #1] div_valid requires pre_oversold < 30
+        div_valid = div4 and pre_oversold
+
+        # --- 1H ---
         rsi1_vals       = calc_rsi(closes_1h)
         ml1, sl1, hist1 = calc_macd(closes_1h)
         rsi1_last       = rsi1_vals[-1]
@@ -271,7 +309,7 @@ def analyze(symbol, is_negative):
         cross1, _       = check_macd_cross(hist1)
         conf_1h         = rsi1_v and (div1 or cross1)
 
-        # Structural SL & TP
+        # --- Structural SL & TP ---
         sl, sl_pct = calc_structural_sl(closes_4h, lows_4h, price)
         if sl is None:
             return None
@@ -286,39 +324,54 @@ def analyze(symbol, is_negative):
             if not bullish_candle:
                 return None
 
-        div_valid  = div4 and pre_oversold
+        # --- [FIX #7] MACD below zero bonus ---
+        macd_below_zero = ml4[-1] < 0
+
+        # --- [FIX #9] Histogram acceleration bonus ---
+        hist_accel = check_histogram_acceleration(hist4)
+
+        # --- Scoring ---
         core_score = sum([div_valid, cross4, rsi4_v])
-        bonus      = sum([conf_1h, vol_ratio >= 1.5, trend4 == 'up', bullish_candle])
+        bonus      = sum([
+            conf_1h,
+            vol_ratio >= 1.5,
+            trend4 == 'up',
+            bullish_candle,
+            macd_below_zero,   # [NEW #7]
+            hist_accel,        # [NEW #9]
+        ])
 
         if vol_ratio >= 2.5:   vol_label = '🐋🐋 دخول حيتان قوي'
         elif vol_ratio >= 1.5: vol_label = f'🐋 دخول حيتان ({vol_ratio}x)'
         else:                  vol_label = f'{vol_ratio}x عادي'
 
         return {
-            'symbol':        symbol,
-            'price':         price,
-            'rsi4':          round(rsi4_last, 1),
-            'rsi4_cls':      rsi4_cls,
-            'rsi1':          round(rsi1_last, 1),
-            'div4':          div_valid,
-            'pre_oversold':  pre_oversold,
-            'cross4':        cross4,
-            'cross4_age':    cross4_age,
-            'conf_1h':       conf_1h,
-            'trend4':        trend4,
-            'vol_ratio':     round(vol_ratio, 1),
-            'vol_label':     vol_label,
-            'bullish_candle':bullish_candle,
-            'candle_chg':    candle_chg,
-            'core_score':    core_score,
-            'bonus':         bonus,
-            'tp':            round(tp, 6),
-            'sl':            round(sl, 6),
-            'tp_pct':        round(tp_pct, 2),
-            'sl_pct':        round(sl_pct, 2),
-            'rr':            round(rr, 1),
-            'resistance':    round(resistance, 6),
-            'is_negative':   is_negative,
+            'symbol':          symbol,
+            'price':           price,
+            'rsi4':            round(rsi4_last, 1),
+            'rsi4_cls':        rsi4_cls,
+            'rsi1':            round(rsi1_last, 1),
+            'div4':            div_valid,
+            'pre_oversold':    pre_oversold,
+            'cross4':          cross4,
+            'cross4_age':      cross4_age,
+            'conf_1h':         conf_1h,
+            'trend4':          trend4,
+            'vol_ratio':       round(vol_ratio, 1),
+            'vol_label':       vol_label,
+            'bullish_candle':  bullish_candle,
+            'candle_chg':      candle_chg,
+            'macd_below_zero': macd_below_zero,
+            'hist_accel':      hist_accel,
+            'core_score':      core_score,
+            'bonus':           bonus,
+            'tp':              round(tp, 6),
+            'sl':              round(sl, 6),
+            'tp_pct':          round(tp_pct, 2),
+            'sl_pct':          round(sl_pct, 2),
+            'rr':              round(rr, 1),
+            'resistance':      round(resistance, 6),
+            'is_negative':     is_negative,
         }
     except Exception as e:
         print(f"[Analyze Error] {symbol}: {e}")
@@ -328,10 +381,12 @@ def analyze(symbol, is_negative):
 # FORMAT MESSAGE
 # ============================================================
 def format_signal(data, signal_type, fg):
-    trend_map = {'up':'📈 صاعد', 'down':'📉 هابط', 'neutral':'➡️ محايد'}
-    icon  = '🟢' if signal_type == 'strong' else '🟡'
-    label = 'إشارة قوية — يمكن الدخول' if signal_type == 'strong' else 'راقب — ادخل بحذر'
-    neg_line = '⚡ _عملة في نطاق سالب — تأكد قبل الدخول_\n' if data['is_negative'] else ''
+    trend_map  = {'up':'📈 صاعد', 'down':'📉 هابط', 'neutral':'➡️ محايد'}
+    icon       = '🟢' if signal_type == 'strong' else '🟡'
+    label      = 'إشارة قوية — يمكن الدخول' if signal_type == 'strong' else 'راقب — ادخل بحذر'
+    neg_line   = '⚡ _عملة في نطاق سالب — تأكد قبل الدخول_\n' if data['is_negative'] else ''
+    macd_line  = '📉 MACD تحت الصفر ✅ (+bonus)\n' if data['macd_below_zero'] else ''
+    accel_line = '📈 زخم هيستوغرام متصاعد ✅ (+bonus)\n' if data['hist_accel'] else ''
 
     return (
         f"{icon} *{label}*: `{data['symbol']}`\n"
@@ -341,13 +396,15 @@ def format_signal(data, signal_type, fg):
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📊 RSI 4H: `{data['rsi4']}` [{data['rsi4_cls']}]\n"
         f"📊 RSI 1H: `{data['rsi1']}`\n"
-        f"📉 Divergence: {'✅ نعم (RSI كان <35 🔥)' if data['div4'] else '❌ لا'}\n"
+        f"📉 Divergence: {'✅ نعم (RSI كان <30 🔥)' if data['div4'] else '❌ لا'}\n"
         f"⚡ MACD Cross: {'✅ نعم (' + str(data['cross4_age']) + ' شمعات)' if data['cross4'] else '❌ لا'}\n"
         f"🔄 تأكيد 1H: {'✅ نعم' if data['conf_1h'] else '❌ لا'}\n"
         f"📈 الاتجاه: {trend_map.get(data['trend4'], data['trend4'])}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📦 الحجم: {data['vol_label']}\n"
         f"🕯️ شمعة خضراء: {'✅ +' + str(data['candle_chg']) + '%' if data['bullish_candle'] else '❌ لا'}\n"
+        f"{macd_line}"
+        f"{accel_line}"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"{fg['text']}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
@@ -390,18 +447,21 @@ def run_scanner(fg):
         bonus = data['bonus']
         rr    = data['rr']
         trend = data['trend4']
+        div4  = data['div4']
 
+        # STRONG: all 3 core + trend ok + RR>=1.5
         if core == 3 and trend != 'down' and rr >= 1.5:
             send_telegram(format_signal(data, 'strong', fg))
             mark_alerted(symbol)
             strong_count += 1
-            print(f"  🟢 STRONG: {symbol}")
+            print(f"  🟢 STRONG: {symbol} | core:{core} bonus:{bonus} rr:{rr}")
 
-        elif core == 2 and bonus >= 2 and rr >= 1.3:
+        # [FIX #8] WATCH: div4 REQUIRED + bonus>=2 + RR>=1.5 (raised from 1.3)
+        elif core == 2 and div4 and bonus >= 2 and rr >= 1.5 and trend != 'down':
             send_telegram(format_signal(data, 'watch', fg))
             mark_alerted(symbol)
             watch_count += 1
-            print(f"  🟡 WATCH: {symbol}")
+            print(f"  🟡 WATCH: {symbol} | core:{core} bonus:{bonus} rr:{rr}")
 
         time.sleep(0.3)
 
@@ -418,10 +478,13 @@ def send_heartbeat(fg):
     today = str(date.today())
     if last_heartbeat_day != today:
         send_telegram(
-            f"💓 *رادار v3.1 — يعمل*\n"
+            f"💓 *رادار v4.0 — يعمل*\n"
             f"📅 {today}\n"
             f"🔄 كل 30 دقيقة\n"
-            f"✅ Smart Sleep · Structural SL · BTC Filter\n"
+            f"✅ pre_oversold <30 · Swing dist >=6\n"
+            f"✅ Strict LL · MACD lookback=3\n"
+            f"✅ MACD below zero bonus · Hist acceleration\n"
+            f"✅ WATCH: div required + RR>=1.5\n"
             f"{fg['text']}"
         )
         last_heartbeat_day = today
@@ -431,15 +494,17 @@ def send_heartbeat(fg):
 # ============================================================
 if __name__ == "__main__":
     send_telegram(
-        "🚀 *رادار v3.1 يعمل الآن*\n\n"
-        "✅ Structural SL (max 2%)\n"
-        "✅ Smart BTC Sleep (خفيف/عميق)\n"
-        "✅ صحيان تلقائي عند ارتداد BTC\n"
-        "✅ RSI Pre-Oversold (<35)\n"
-        "✅ نطاق -4% إلى +2%\n"
-        "✅ Volume Spike شرطي\n"
-        "✅ شمعة خضراء للسالب\n"
-        "✅ Fear & Greed · Anti-duplicate"
+        "🚀 *رادار v4.0 يعمل الآن*\n\n"
+        "🆕 التحسينات الجديدة:\n"
+        "✅ pre_oversold: <30 (كان <35)\n"
+        "✅ MACD lookback: 3 شموع (كان 4)\n"
+        "✅ Swing lookback: 3 (كان 2)\n"
+        "✅ Lower Low صارمة — لا تسامح\n"
+        "✅ حد أدنى 6 شموع بين السوينغز\n"
+        "✅ Divergence طازج: آخر 7 شموع\n"
+        "✅ Bonus: MACD تحت الصفر\n"
+        "✅ Bonus: زخم هيستوغرام متصاعد\n"
+        "✅ WATCH: تتطلب DIV + RR>=1.5\n"
     )
 
     while True:
@@ -450,27 +515,25 @@ if __name__ == "__main__":
             btc_status, btc_chg, btc_price = get_btc_status()
 
             if btc_status == 'healthy':
-                # Reset sleep state
                 if sleep_mode_notified:
                     send_telegram(
                         f"✅ *البوت استيقظ*\n"
                         f"BTC تعافى: {btc_chg:.2f}%\n"
                         f"استئناف الفحص الآن 🔍"
                     )
-                    sleep_mode_notified = False
-                    btc_sleep_low = None
+                    globals()['sleep_mode_notified'] = False
+                    globals()['btc_sleep_low']       = None
                 run_scanner(fg)
 
             elif btc_status == 'recovering':
-                # BTC bounced +1% from low — wake up early
                 if sleep_mode_notified:
                     send_telegram(
                         f"⚡ *استيقاظ مبكر*\n"
                         f"BTC ارتد من القاع +1%\n"
                         f"فحص فوري للفرص 🔍"
                     )
-                    sleep_mode_notified = False
-                    btc_sleep_low = None
+                    globals()['sleep_mode_notified'] = False
+                    globals()['btc_sleep_low']       = None
                 run_scanner(fg)
 
             elif btc_status == 'light_sleep':
@@ -480,7 +543,7 @@ if __name__ == "__main__":
                         f"BTC: {btc_chg:.2f}%\n"
                         f"سأصحى تلقائياً عند ارتداد BTC"
                     )
-                    sleep_mode_notified = True
+                    globals()['sleep_mode_notified'] = True
                 print(f"[Light Sleep] BTC {btc_chg:.2f}%")
 
             elif btc_status == 'deep_sleep':
@@ -491,7 +554,7 @@ if __name__ == "__main__":
                         f"السوق في هبوط حاد\n"
                         f"سأصحى عند تعافي BTC"
                     )
-                    sleep_mode_notified = True
+                    globals()['sleep_mode_notified'] = True
                 print(f"[Deep Sleep] BTC {btc_chg:.2f}%")
 
         except Exception as e:
